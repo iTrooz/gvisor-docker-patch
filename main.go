@@ -1,244 +1,138 @@
 package main
 
 import (
-	"bytes"
-	"encoding/binary"
 	"fmt"
+	"log"
+	"net"
 	"os"
-	"syscall"
-	"unsafe"
+	"time"
+
+	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
+	"github.com/mdlayher/netlink"
+	"golang.org/x/sys/unix"
 )
 
 const (
-	tableFilter = "filter"
-
-	nfInetNumHooks  = 5
-	nfInetLocalOut  = 3
-	nfAcceptVerdict = 1
-
-	xtTableMaxNameLen = 32
-
-	iptBaseCtl      = 64
-	iptSoSetReplace = iptBaseCtl
-	iptSoGetInfo    = iptBaseCtl
-	iptSoGetEntries = iptBaseCtl + 1
-
-	sizeOfIPTEntry         = 112
-	sizeOfXTStandardTarget = 40
-	sizeOfIPTGetInfo       = 84
-	sizeOfIPTGetEntries    = 40
-	sizeOfIPTReplace       = 96
+	tableName             = "copilot_inject"
+	chainName             = "output_specific"
+	netlinkRequestTimeout = 5 * time.Second
 )
 
 func main() {
-	if err := injectDummyRule(); err != nil {
+	fmt.Println("installing DNS nftables rule for Docker..")
+
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
+	if err := injectSpecificNftRule(); err != nil {
 		fmt.Fprintf(os.Stderr, "inject failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("dummy legacy iptables rule injected (or already present)")
+	fmt.Println("DNS nftables rule installed")
 }
 
-func injectDummyRule() error {
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
+func injectSpecificNftRule() error {
+	log.Printf("connecting to nftables")
+	conn, err := nftables.New(nftables.WithSockOptions(func(c *netlink.Conn) error {
+		deadline := time.Now().Add(netlinkRequestTimeout)
+		return c.SetDeadline(deadline)
+	}))
 	if err != nil {
-		return fmt.Errorf("open raw socket (need CAP_NET_ADMIN/CAP_NET_RAW): %w", err)
-	}
-	defer syscall.Close(fd)
-
-	info, tableName, err := getTableInfo(fd, tableFilter)
-	if err != nil {
-		return err
+		return fmt.Errorf("open nftables netlink connection: %w", err)
 	}
 
-	entriesBlob, err := getTableEntriesBlob(fd, tableName, info.size)
+	table, err := ensureTable(conn, tableName, nftables.TableFamilyIPv4)
 	if err != nil {
 		return err
 	}
-
-	dummyRule := buildDummyAcceptRule()
-	if bytes.Contains(entriesBlob, dummyRule) {
-		return nil
+	log.Printf("using table family=%v name=%q", table.Family, table.Name)
+	if err := conn.Flush(); err != nil {
+		return fmt.Errorf("nftables %s failed (need CAP_NET_ADMIN): %w", "table setup", err)
 	}
 
-	insertAt := int(info.underflow[nfInetLocalOut])
-	if insertAt < 0 || insertAt > len(entriesBlob) {
-		return fmt.Errorf("invalid insertion offset %d for OUTPUT underflow", insertAt)
+	chain, err := ensureOutputFilterChain(conn, table, chainName)
+	if err != nil {
+		return err
+	}
+	log.Printf("using chain name=%q hook=output type=filter", chain.Name)
+	if err := conn.Flush(); err != nil {
+		return fmt.Errorf("nftables %s failed (need CAP_NET_ADMIN): %w", "chain setup", err)
 	}
 
-	newEntries := make([]byte, 0, len(entriesBlob)+len(dummyRule))
-	newEntries = append(newEntries, entriesBlob[:insertAt]...)
-	newEntries = append(newEntries, dummyRule...)
-	newEntries = append(newEntries, entriesBlob[insertAt:]...)
-
-	ruleLen := uint32(len(dummyRule))
-	replace := iptReplace{
-		name:       tableName,
-		validHooks: info.validHooks,
-		numEntries: info.numEntries + 1,
-		size:       info.size + ruleLen,
-		hookEntry:  info.hookEntry,
-		underflow:  info.underflow,
+	resolver := net.ParseIP("8.8.8.8").To4()
+	if resolver == nil {
+		return fmt.Errorf("invalid resolver IPv4 address")
 	}
+	log.Printf("adding rule: udp daddr=%s dport=53 accept", resolver.String())
 
-	for i := 0; i < nfInetNumHooks; i++ {
-		if replace.hookEntry[i] >= uint32(insertAt) {
-			replace.hookEntry[i] += ruleLen
-		}
-		if replace.underflow[i] >= uint32(insertAt) {
-			replace.underflow[i] += ruleLen
-		}
+	conn.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: chain,
+		Exprs: []expr.Any{
+			// Match IPv4 protocol = UDP.
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 9, Len: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_UDP}},
+			// Match destination address = 8.8.8.8.
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 16, Len: 4},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: resolver},
+			// Match destination port = 53 (DNS).
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x00, 0x35}},
+			&expr.Verdict{Kind: expr.VerdictAccept},
+		},
+	})
+
+	log.Printf("applying nftables rule")
+	if err := conn.Flush(); err != nil {
+		return fmt.Errorf("nftables %s failed (need CAP_NET_ADMIN): %w", "rule apply", err)
 	}
-
-	replaceBuf := make([]byte, sizeOfIPTReplace+len(newEntries))
-	marshalIPTReplace(replaceBuf[:sizeOfIPTReplace], replace)
-	copy(replaceBuf[sizeOfIPTReplace:], newEntries)
-
-	if err := setSockOpt(fd, syscall.SOL_IP, iptSoSetReplace, replaceBuf); err != nil {
-		return fmt.Errorf("IPT_SO_SET_REPLACE failed (need legacy iptables ABI): %w", err)
-	}
+	log.Printf("nftables changes applied successfully")
 
 	return nil
 }
 
-func buildDummyAcceptRule() []byte {
-	total := sizeOfIPTEntry + sizeOfXTStandardTarget
-	buf := make([]byte, total)
-
-	// ipt_entry.target_offset and next_offset.
-	binary.LittleEndian.PutUint16(buf[88:90], uint16(sizeOfIPTEntry))
-	binary.LittleEndian.PutUint16(buf[90:92], uint16(total))
-
-	targetStart := sizeOfIPTEntry
-
-	// xt_entry_target.target_size for a standard target.
-	binary.LittleEndian.PutUint16(buf[targetStart:targetStart+2], uint16(sizeOfXTStandardTarget))
-
-	// xt_standard_target.verdict for ACCEPT is -NF_ACCEPT-1 == -2.
-	acceptVerdict := int32(-nfAcceptVerdict - 1)
-	binary.LittleEndian.PutUint32(buf[targetStart+32:targetStart+36], uint32(acceptVerdict))
-
-	return buf
-}
-
-type iptGetInfo struct {
-	name       [xtTableMaxNameLen]byte
-	validHooks uint32
-	hookEntry  [nfInetNumHooks]uint32
-	underflow  [nfInetNumHooks]uint32
-	numEntries uint32
-	size       uint32
-}
-
-type iptReplace struct {
-	name       [xtTableMaxNameLen]byte
-	validHooks uint32
-	numEntries uint32
-	size       uint32
-	hookEntry  [nfInetNumHooks]uint32
-	underflow  [nfInetNumHooks]uint32
-}
-
-func getTableInfo(fd int, table string) (iptGetInfo, [xtTableMaxNameLen]byte, error) {
-	var tableName [xtTableMaxNameLen]byte
-	copy(tableName[:], []byte(table))
-
-	req := make([]byte, sizeOfIPTGetInfo)
-	copy(req[:xtTableMaxNameLen], tableName[:])
-
-	if err := getSockOpt(fd, syscall.SOL_IP, iptSoGetInfo, req); err != nil {
-		return iptGetInfo{}, tableName, fmt.Errorf("IPT_SO_GET_INFO(%s): %w", table, err)
+func ensureTable(conn *nftables.Conn, name string, family nftables.TableFamily) (*nftables.Table, error) {
+	tables, err := conn.ListTables()
+	if err != nil {
+		return nil, fmt.Errorf("list nftables tables: %w", err)
 	}
 
-	info := unmarshalIPTGetInfo(req)
-	return info, tableName, nil
-}
-
-func getTableEntriesBlob(fd int, tableName [xtTableMaxNameLen]byte, tableSize uint32) ([]byte, error) {
-	req := make([]byte, sizeOfIPTGetEntries+int(tableSize))
-	copy(req[:xtTableMaxNameLen], tableName[:])
-	binary.LittleEndian.PutUint32(req[32:36], tableSize)
-
-	if err := getSockOpt(fd, syscall.SOL_IP, iptSoGetEntries, req); err != nil {
-		return nil, fmt.Errorf("IPT_SO_GET_ENTRIES: %w", err)
-	}
-
-	payload := make([]byte, len(req)-sizeOfIPTGetEntries)
-	copy(payload, req[sizeOfIPTGetEntries:])
-	return payload, nil
-}
-
-func marshalIPTReplace(dst []byte, r iptReplace) {
-	copy(dst[:xtTableMaxNameLen], r.name[:])
-	binary.LittleEndian.PutUint32(dst[32:36], r.validHooks)
-	binary.LittleEndian.PutUint32(dst[36:40], r.numEntries)
-	binary.LittleEndian.PutUint32(dst[40:44], r.size)
-
-	off := 44
-	for i := 0; i < nfInetNumHooks; i++ {
-		binary.LittleEndian.PutUint32(dst[off:off+4], r.hookEntry[i])
-		off += 4
-	}
-	for i := 0; i < nfInetNumHooks; i++ {
-		binary.LittleEndian.PutUint32(dst[off:off+4], r.underflow[i])
-		off += 4
-	}
-	// num_counters and counters pointer are left zeroed.
-}
-
-func unmarshalIPTGetInfo(src []byte) iptGetInfo {
-	var out iptGetInfo
-	copy(out.name[:], src[:xtTableMaxNameLen])
-	out.validHooks = binary.LittleEndian.Uint32(src[32:36])
-
-	off := 36
-	for i := 0; i < nfInetNumHooks; i++ {
-		out.hookEntry[i] = binary.LittleEndian.Uint32(src[off : off+4])
-		off += 4
-	}
-	for i := 0; i < nfInetNumHooks; i++ {
-		out.underflow[i] = binary.LittleEndian.Uint32(src[off : off+4])
-		off += 4
-	}
-	out.numEntries = binary.LittleEndian.Uint32(src[76:80])
-	out.size = binary.LittleEndian.Uint32(src[80:84])
-	return out
-}
-
-func getSockOpt(fd, level, name int, buf []byte) error {
-	l := uint32(len(buf))
-	_, _, errno := syscall.RawSyscall6(
-		syscall.SYS_GETSOCKOPT,
-		uintptr(fd),
-		uintptr(level),
-		uintptr(name),
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(unsafe.Pointer(&l)),
-		0,
-	)
-	if errno != 0 {
-		return errno
-	}
-	if int(l) < len(buf) {
-		for i := int(l); i < len(buf); i++ {
-			buf[i] = 0
+	for _, t := range tables {
+		if t.Name == name && t.Family == family {
+			log.Printf("found existing table %q", name)
+			return t, nil
 		}
 	}
-	return nil
+
+	t := &nftables.Table{Name: name, Family: family}
+	log.Printf("creating table %q", name)
+	conn.AddTable(t)
+	return t, nil
 }
 
-func setSockOpt(fd, level, name int, buf []byte) error {
-	_, _, errno := syscall.RawSyscall6(
-		syscall.SYS_SETSOCKOPT,
-		uintptr(fd),
-		uintptr(level),
-		uintptr(name),
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(len(buf)),
-		0,
-	)
-	if errno != 0 {
-		return errno
+func ensureOutputFilterChain(conn *nftables.Conn, table *nftables.Table, name string) (*nftables.Chain, error) {
+	chains, err := conn.ListChains()
+	if err != nil {
+		return nil, fmt.Errorf("list nftables chains: %w", err)
 	}
-	return nil
+
+	for _, c := range chains {
+		if c.Table != nil && c.Table.Name == table.Name && c.Table.Family == table.Family && c.Name == name {
+			log.Printf("found existing chain %q", name)
+			return c, nil
+		}
+	}
+
+	priority := nftables.ChainPriorityFilter
+	c := &nftables.Chain{
+		Name:     name,
+		Table:    table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookOutput,
+		Priority: priority,
+	}
+	log.Printf("creating chain %q on output hook", name)
+	conn.AddChain(c)
+	return c, nil
 }

@@ -28,13 +28,6 @@ def exec_in_container(client: docker.DockerClient, container_id: str, cmd: list[
     text = output.decode("utf-8", errors="replace") if isinstance(output, (bytes, bytearray)) else str(output)
     return int(inspect.get("ExitCode") or 0), text.strip()
 
-
-def is_gvisor_runtime(runtime: str, runtime_match: str) -> bool:
-    if not runtime:
-        return False
-    return runtime == runtime_match or runtime_match in runtime
-
-
 def watch(args: argparse.Namespace) -> int:
     if not os.path.exists(args.inject_bin):
         raise RuntimeError(f"Binary to inject not found at {args.inject_bin}")
@@ -63,7 +56,7 @@ def watch(args: argparse.Namespace) -> int:
             container = client.containers.get(container_id)
             runtime = (container.attrs.get("HostConfig") or {}).get("Runtime", "")
             print(repr(runtime))
-            if not is_gvisor_runtime(runtime, args.runtime_match):
+            if runtime != args.runtime_match:
                 continue
 
             print(f"gVisor container {container_id} joined network {network_id}; running injected bin")
@@ -74,8 +67,7 @@ def watch(args: argparse.Namespace) -> int:
             if code != 0:
                 raise RuntimeError(f"injected bin exited with {code}")
 
-            # Best-effort delete in case self-delete did not happen.
-            # exec_in_container(client, container_id, ["rm", "-f", INJECTED_BIN_CONTAINER_PATH])
+            exec_in_container(client, container_id, ["rm", "-f", INJECTED_BIN_CONTAINER_PATH])
         except Exception as exc:  # pylint: disable=broad-except
             print(f"failed handling container {container_id}: {exc}")
         finally:
@@ -88,7 +80,7 @@ def watch(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Watch Docker network connect events and run legacy iptables injector in gVisor containers."
+        description="Watch Docker network connect events and run nftables injector in gVisor containers."
     )
     parser.add_argument("--inject-bin", help="Path to binary to inject")
     parser.add_argument("--runtime-match", default="runsc", help="Runtime name to match")
