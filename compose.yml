@@ -10,4 +10,4 @@ services:
     pid: host # Needed to access netns
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock # Needed to listen to docker events
-      - /var/lib/docker/containers:/var/lib/docker/containers # Needed to patch /etc/resolv.conf
+      - /:/mnt # Needed to patch /etc/resolv.conf (although could be more specific)

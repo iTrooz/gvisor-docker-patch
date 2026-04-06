@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
@@ -15,6 +16,7 @@ import (
 )
 
 const SETUP_NETNS_SCRIPT = "./setup_netns.sh"
+const HOST_MOUNT_PATH = "/mnt"
 
 var builtinNetworks = map[string]struct{}{
 	"bridge": {},
@@ -46,10 +48,11 @@ func findNetworkGateway(inspect container.InspectResponse) (string, string, erro
 }
 
 // injectResolvConf writes the container resolv.conf through its host ResolvConfPath.
-func injectResolvConf(resolvConfPath, gatewayIP string) error {
+func injectResolvConf(hostResolvConfPath, gatewayIP string) error {
+	ctHostResolvConfPath := path.Join(HOST_MOUNT_PATH, hostResolvConfPath)
 	content := []byte(fmt.Sprintf("# Written by gvisor-docker-patch\nnameserver %s\n", gatewayIP))
-	if err := os.WriteFile(resolvConfPath, content, 0644); err != nil {
-		return fmt.Errorf("write resolv.conf at %s: %w", resolvConfPath, err)
+	if err := os.WriteFile(ctHostResolvConfPath, content, 0644); err != nil {
+		return fmt.Errorf("write resolv.conf at %s: %w", ctHostResolvConfPath, err)
 	}
 
 	return nil
