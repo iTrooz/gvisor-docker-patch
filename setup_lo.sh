@@ -1,4 +1,4 @@
-set -xe
+set -e
 
 GATEWAY_IP="$1"
 CONTAINER_IP="$2"
