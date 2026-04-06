@@ -8,15 +8,15 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 )
+
+const SETUP_NETNS_SCRIPT = "./setup_netns.sh"
 
 var builtinNetworks = map[string]struct{}{
 	"bridge": {},
@@ -30,7 +30,7 @@ type eventKey struct {
 }
 
 // findNetworkGateway finds the gateway and container IP for the first custom Docker network.
-func findNetworkGateway(inspect types.ContainerJSON) (string, string, error) {
+func findNetworkGateway(inspect container.InspectResponse) (string, string, error) {
 	if inspect.NetworkSettings == nil {
 		return "", "", errors.New("container has no network settings")
 	}
@@ -75,43 +75,34 @@ func injectResolvConf(ctx context.Context, cli *client.Client, containerID, gate
 	return nil
 }
 
-// runSetupLo runs setup_lo.sh in the container network namespace via nsenter.
-func runSetupLo(pid int, setupLoPath, gatewayIP, containerIP string) error {
+// setupNetNs runs setup_netns.sh in the container network namespace via nsenter.
+func setupNetNs(pid int, gatewayIP, containerIP string) error {
 	if pid == 0 {
 		return errors.New("container has no PID")
 	}
 
-	cmd := exec.Command("nsenter", "-t", fmt.Sprintf("%d", pid), "-n", "--", setupLoPath, gatewayIP, containerIP)
+	cmd := exec.Command("nsenter", "-t", fmt.Sprintf("%d", pid), "-n", "--", SETUP_NETNS_SCRIPT, gatewayIP, containerIP)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return fmt.Errorf("setup_lo.sh exited with %d", exitErr.ExitCode())
+			return fmt.Errorf("netns setup script exited with %d", exitErr.ExitCode())
 		}
-		return fmt.Errorf("run setup_lo.sh: %w", err)
+		return fmt.Errorf("netns setup script: %w", err)
 	}
 
 	return nil
 }
 
 // watch listens for Docker network connect events and configures matching containers.
-func watch(setupLoArg, runtimeMatch string) error {
-	setupLoPath, err := filepath.Abs(setupLoArg)
-	if err != nil {
-		return fmt.Errorf("resolve setup_lo.sh path: %w", err)
-	}
-	if _, err := os.Stat(setupLoPath); err != nil {
-		return fmt.Errorf("setup_lo.sh not found at %s", setupLoPath)
-	}
-
+func watch(runtimeMatch string) error {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return fmt.Errorf("create docker client: %w", err)
 	}
-	defer cli.Close()
 
 	inflight := make(map[eventKey]struct{})
 
@@ -172,7 +163,7 @@ func watch(setupLoArg, runtimeMatch string) error {
 				}
 				fmt.Printf("  injected /etc/resolv.conf with nameserver %s\n", gatewayIP)
 
-				if err := runSetupLo(inspect.State.Pid, setupLoPath, gatewayIP, containerIP); err != nil {
+				if err := setupNetNs(inspect.State.Pid, gatewayIP, containerIP); err != nil {
 					fmt.Printf("failed handling container %s: %v\n", containerID, err)
 					return
 				}
@@ -196,17 +187,22 @@ func shortID(id string) string {
 }
 
 // parseArgs parses command-line flags.
-func parseArgs() (string, string) {
-	setupLo := flag.String("setup-lo", "./setup_lo.sh", "Path to setup_lo.sh script")
+func parseArgs() string {
 	runtimeMatch := flag.String("runtime-match", "runsc", "Runtime name to match")
 	flag.Parse()
-	return *setupLo, *runtimeMatch
+	return *runtimeMatch
 }
 
 // main is the process entrypoint.
 func main() {
-	setupLo, runtimeMatch := parseArgs()
-	if err := watch(setupLo, runtimeMatch); err != nil {
+	runtimeMatch := parseArgs()
+
+	if _, err := os.Stat(SETUP_NETNS_SCRIPT); err != nil {
+		fmt.Fprintln(os.Stderr, fmt.Errorf("netns setup script not found at %s", SETUP_NETNS_SCRIPT))
+		os.Exit(1)
+	}
+
+	if err := watch(runtimeMatch); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

@@ -1,3 +1,5 @@
+# This script injects "routing rules" into the Docker netns (not exactly the gVisor env !)
+# to route DNS request to the Docker DNS
 set -e
 
 GATEWAY_IP="$1"
