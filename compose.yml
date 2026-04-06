@@ -1,0 +1,15 @@
+services:
+  gvisor-docker-patch:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gvisor-docker-patch
+    restart: unless-stopped
+    privileged: true # Needed to access netns
+    pid: host # Needed to access netns
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock # Needed to listen to docker events
+      - /var/lib/docker/containers:/var/lib/docker/containers # Needed to patch /etc/resolv.conf
+    command:
+      - --runtime-match
+      - runsc
