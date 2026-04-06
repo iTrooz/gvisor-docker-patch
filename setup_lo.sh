@@ -1,0 +1,51 @@
+set -xe
+
+GATEWAY_IP="$1"
+CONTAINER_IP="$2"
+
+if [ -z "$GATEWAY_IP" ] || [ -z "$CONTAINER_IP" ]; then
+  echo "Usage: $0 <gateway_ip> <container_ip>" >&2
+  exit 1
+fi
+
+tc qdisc add dev eth0 clsact || true
+tc qdisc add dev lo clsact || true
+
+DOCKER_DNS_PORT=$(ss -lun | awk 'NR>1 {split($4, a, ":"); print a[2]}')
+
+# Setup route to Docker DNS:
+# - Only match DNS packets going to the host
+# - Write src and dst IPs (src is a special IP that we can match on the way back, dst is the loopback IP)
+# - Docker OUTPUT table will not be used, so rewrite the port ourselves
+# Simulate packets coming from lo
+tc filter del dev eth0 ingress
+tc filter del dev eth0 egress
+tc filter replace dev eth0 egress protocol ip pref 49152 flower \
+  dst_ip "$GATEWAY_IP" \
+  ip_proto udp \
+  dst_port 53 \
+  action pedit ex munge ip src set 127.0.0.12 pipe \
+  action pedit ex munge ip dst set 127.0.0.11 pipe \
+  action pedit ex munge udp dport set $DOCKER_DNS_PORT pipe \
+  action csum ip and udp pipe \
+  action skbedit ptype host pipe \
+  action mirred ingress redirect dev lo
+
+# Setup route from Docker DNS back to gVisor
+# We only match responses by matching our dummy 127.0.0.12 address
+tc filter del dev lo ingress
+tc filter del dev lo egress
+tc filter replace dev lo egress protocol ip pref 49152 flower \
+  dst_ip 127.0.0.12 \
+  ip_proto udp \
+  src_port $DOCKER_DNS_PORT \
+  action pedit ex munge ip src set "$GATEWAY_IP" pipe \
+  action pedit ex munge ip dst set "$CONTAINER_IP" pipe \
+  action pedit ex munge udp sport set 53 pipe \
+  action csum ip and udp pipe \
+  action mirred ingress redirect dev eth0
+
+# Setup container IP route in L2 and L3
+NS_MAC="$(ip -j link show eth0 | jq -r '.[].address')"
+ip neigh replace "$CONTAINER_IP" lladdr $NS_MAC dev eth0
+ip ro replace "$CONTAINER_IP" dev eth0

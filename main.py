@@ -1,36 +1,61 @@
 #!/usr/bin/env python3
 
 import argparse
-import io
 import os
+import subprocess
 import sys
-import tarfile
 import docker
 
-INJECTED_BIN_CONTAINER_PATH = "/inject-bin"
-
-def put_file(container, host_path: str, container_path: str) -> None:
-    data = io.BytesIO()
-    container_dir = os.path.dirname(container_path) or "/"
-    arcname = os.path.basename(container_path)
-    with tarfile.open(fileobj=data, mode="w") as tar:
-        tar.add(host_path, arcname=arcname)
-    data.seek(0)
-    ok = container.put_archive(container_dir, data.read())
-    if not ok:
-        raise RuntimeError("docker put_archive returned false")
+BUILTIN_NETWORKS = {"bridge", "host", "none"}
 
 
-def exec_in_container(client: docker.DockerClient, container_id: str, cmd: list[str]) -> tuple[int, str]:
+# Find the gateway and container IP of the first custom Docker network.
+def find_custom_gateway(container) -> tuple[str, str]:
+    networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+    for name, cfg in networks.items():
+        if name in BUILTIN_NETWORKS:
+            continue
+        gateway = cfg.get("Gateway")
+        container_ip = cfg.get("IPAddress")
+        if gateway and container_ip:
+            return gateway, container_ip
+    raise RuntimeError("no custom network with a gateway found")
+
+
+# Write /etc/resolv.conf inside the container pointing at the given nameserver.
+def inject_resolv_conf(client: docker.DockerClient, container_id: str, gateway_ip: str) -> None:
+    cmd = ["sh", "-c", f"echo 'nameserver {gateway_ip}' > /etc/resolv.conf"]
     exec_id = client.api.exec_create(container_id, cmd=cmd)["Id"]
     output = client.api.exec_start(exec_id, demux=False)
     inspect = client.api.exec_inspect(exec_id)
-    text = output.decode("utf-8", errors="replace") if isinstance(output, (bytes, bytearray)) else str(output)
-    return int(inspect.get("ExitCode") or 0), text.strip()
+    exit_code = int(inspect.get("ExitCode") or 0)
+    if exit_code != 0:
+        text = output.decode("utf-8", errors="replace") if isinstance(output, (bytes, bytearray)) else str(output)
+        raise RuntimeError(f"writing resolv.conf failed (exit {exit_code}): {text}")
 
+
+# Run setup_lo.sh in the container's network namespace via nsenter.
+def run_setup_lo(container, setup_lo_path: str, gateway_ip: str, container_ip: str) -> None:
+    pid = container.attrs["State"]["Pid"]
+    if not pid:
+        raise RuntimeError("container has no PID")
+    result = subprocess.run(
+        ["nsenter", "-t", str(pid), "-n", "--", setup_lo_path, gateway_ip, container_ip],
+        capture_output=True, text=True,
+    )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    if result.returncode != 0:
+        raise RuntimeError(f"setup_lo.sh exited with {result.returncode}")
+
+
+# Watch Docker events and configure DNS for new gVisor containers.
 def watch(args: argparse.Namespace) -> int:
-    if not os.path.exists(args.inject_bin):
-        raise RuntimeError(f"Binary to inject not found at {args.inject_bin}")
+    setup_lo_path = os.path.abspath(args.setup_lo)
+    if not os.path.exists(setup_lo_path):
+        raise RuntimeError(f"setup_lo.sh not found at {setup_lo_path}")
 
     client = docker.from_env()
     inflight: set[tuple[str, str]] = set()
@@ -39,7 +64,6 @@ def watch(args: argparse.Namespace) -> int:
     stream = client.events(decode=True, filters={"type": ["network"], "event": ["connect"]})
 
     for event in stream:
-
         actor = event.get("Actor", {})
         attrs = actor.get("Attributes", {})
         container_id = attrs.get("container")
@@ -55,20 +79,19 @@ def watch(args: argparse.Namespace) -> int:
         try:
             container = client.containers.get(container_id)
             runtime = (container.attrs.get("HostConfig") or {}).get("Runtime", "")
-            print(repr(runtime))
             if runtime != args.runtime_match:
                 continue
 
-            print(f"gVisor container {container_id} joined network {network_id}; running injected bin")
-            put_file(container, args.inject_bin, INJECTED_BIN_CONTAINER_PATH)
-            code, output = exec_in_container(client, container_id, [INJECTED_BIN_CONTAINER_PATH])
-            if output:
-                print(output)
-            if code != 0:
-                raise RuntimeError(f"injected bin exited with {code}")
+            gateway_ip, container_ip = find_custom_gateway(container)
+            print(f"gVisor container {container_id[:12]} joined network {network_id[:12]}; "
+                  f"gateway={gateway_ip} container_ip={container_ip}")
 
-            exec_in_container(client, container_id, ["rm", "-f", INJECTED_BIN_CONTAINER_PATH])
-        except Exception as exc:  # pylint: disable=broad-except
+            inject_resolv_conf(client, container_id, gateway_ip)
+            print(f"  injected /etc/resolv.conf with nameserver {gateway_ip}")
+
+            run_setup_lo(container, setup_lo_path, gateway_ip, container_ip)
+            print(f"  ran setup_lo.sh successfully")
+        except Exception as exc:
             print(f"failed handling container {container_id}: {exc}")
         finally:
             inflight.discard(key)
@@ -78,11 +101,12 @@ def watch(args: argparse.Namespace) -> int:
     return 0
 
 
+# Parse command-line arguments.
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Watch Docker network connect events and run nftables injector in gVisor containers."
+        description="Watch Docker network connect events and configure DNS for gVisor containers."
     )
-    parser.add_argument("--inject-bin", help="Path to binary to inject")
+    parser.add_argument("--setup-lo", default="./setup_lo.sh", help="Path to setup_lo.sh script")
     parser.add_argument("--runtime-match", default="runsc", help="Runtime name to match")
     return parser.parse_args()
 
