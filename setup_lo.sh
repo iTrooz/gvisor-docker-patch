@@ -49,3 +49,5 @@ tc filter replace dev lo egress protocol ip pref 49152 flower \
 NS_MAC="$(ip -j link show eth0 | jq -r '.[].address')"
 ip neigh replace "$CONTAINER_IP" lladdr $NS_MAC dev eth0
 ip ro replace "$CONTAINER_IP" dev eth0
+
+sysctl -w net.ipv4.conf.all.route_localnet=1
