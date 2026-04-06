@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    image: ghcr.io/itrooz/gvisor-docker-patch:latest
     container_name: gvisor-docker-patch
     restart: unless-stopped
     privileged: true # Needed to access netns
