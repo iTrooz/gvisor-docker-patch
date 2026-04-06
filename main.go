@@ -177,6 +177,11 @@ func parseArgs() string {
 func main() {
 	runtimeMatch := parseArgs()
 
+	if os.Geteuid() != 0 {
+		fmt.Fprintln(os.Stderr, "must run as root")
+		os.Exit(1)
+	}
+
 	if _, err := os.Stat(SETUP_NETNS_SCRIPT); err != nil {
 		fmt.Fprintln(os.Stderr, fmt.Errorf("netns setup script not found at %s", SETUP_NETNS_SCRIPT))
 		os.Exit(1)
