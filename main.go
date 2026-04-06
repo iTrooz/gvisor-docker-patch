@@ -5,10 +5,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
-	"strings"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
@@ -47,29 +45,11 @@ func findNetworkGateway(inspect container.InspectResponse) (string, string, erro
 	return "", "", errors.New("no custom network with a gateway found")
 }
 
-// injectResolvConf writes /etc/resolv.conf inside the container with the provided nameserver.
-func injectResolvConf(ctx context.Context, cli *client.Client, containerID, gatewayIP string) error {
-	cmd := []string{"sh", "-c", fmt.Sprintf("echo 'nameserver %s' > /etc/resolv.conf", gatewayIP)}
-
-	execResp, err := cli.ContainerExecCreate(ctx, containerID, container.ExecOptions{Cmd: cmd})
-	if err != nil {
-		return fmt.Errorf("create exec: %w", err)
-	}
-
-	attach, err := cli.ContainerExecAttach(ctx, execResp.ID, container.ExecAttachOptions{})
-	if err != nil {
-		return fmt.Errorf("start/attach exec: %w", err)
-	}
-	defer attach.Close()
-
-	output, _ := io.ReadAll(attach.Reader)
-
-	inspectResp, err := cli.ContainerExecInspect(ctx, execResp.ID)
-	if err != nil {
-		return fmt.Errorf("inspect exec: %w", err)
-	}
-	if inspectResp.ExitCode != 0 {
-		return fmt.Errorf("writing resolv.conf failed (exit %d): %s", inspectResp.ExitCode, strings.TrimSpace(string(output)))
+// injectResolvConf writes the container resolv.conf through its host ResolvConfPath.
+func injectResolvConf(resolvConfPath, gatewayIP string) error {
+	content := []byte(fmt.Sprintf("# Written by gvisor-docker-patch\nnameserver %s\n", gatewayIP))
+	if err := os.WriteFile(resolvConfPath, content, 0644); err != nil {
+		return fmt.Errorf("write resolv.conf at %s: %w", resolvConfPath, err)
 	}
 
 	return nil
@@ -157,7 +137,7 @@ func watch(runtimeMatch string) error {
 
 				fmt.Printf("gVisor container %s joined network %s; gateway=%s container_ip=%s\n", shortID(containerID), shortID(networkID), gatewayIP, containerIP)
 
-				if err := injectResolvConf(ctx, cli, containerID, gatewayIP); err != nil {
+				if err := injectResolvConf(inspect.ResolvConfPath, gatewayIP); err != nil {
 					fmt.Printf("failed handling container %s: %v\n", containerID, err)
 					return
 				}
