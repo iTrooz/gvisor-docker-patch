@@ -56,3 +56,7 @@ tc filter replace dev lo egress protocol ip pref 49152 flower \
 
 # Allow 127.0.0.11 in this netns to be routed from TC mirred packets (they don't count as locally generated)
 sysctl -w net.ipv4.conf.all.route_localnet=1
+
+# Remove source interface checks since tc is spoofing the packets source
+echo 0 > /proc/sys/net/ipv4/conf/lo/rp_filter
+echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter
