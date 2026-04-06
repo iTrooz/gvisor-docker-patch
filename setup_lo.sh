@@ -31,8 +31,13 @@ tc filter replace dev eth0 egress protocol ip pref 49152 flower \
   action skbedit ptype host pipe \
   action mirred ingress redirect dev lo
 
+# Get mac of ns interface (same as mac of gVisor)
+NS_MAC="$(ip -j link show eth0 | jq -r '.[].address')"
+
 # Setup route from Docker DNS back to gVisor
 # We only match responses by matching our dummy 127.0.0.12 address
+# We also setup container L3 addresses (normal) and L2 dst address (since this ns doesnt get hit by ARP responses)
+# L2 src address doesnt seem to be needed, and is difficult to query (need host ns help), so unset
 tc filter del dev lo ingress
 tc filter del dev lo egress
 tc filter replace dev lo egress protocol ip pref 49152 flower \
@@ -41,13 +46,9 @@ tc filter replace dev lo egress protocol ip pref 49152 flower \
   src_port $DOCKER_DNS_PORT \
   action pedit ex munge ip src set "$GATEWAY_IP" pipe \
   action pedit ex munge ip dst set "$CONTAINER_IP" pipe \
+  action pedit ex munge eth dst set $NS_MAC pipe \
   action pedit ex munge udp sport set 53 pipe \
   action csum ip and udp pipe \
   action mirred ingress redirect dev eth0
-
-# Setup container IP route in L2 and L3
-NS_MAC="$(ip -j link show eth0 | jq -r '.[].address')"
-ip neigh replace "$CONTAINER_IP" lladdr $NS_MAC dev eth0
-ip ro replace "$CONTAINER_IP" dev eth0
 
 sysctl -w net.ipv4.conf.all.route_localnet=1
