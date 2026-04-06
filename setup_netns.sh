@@ -54,4 +54,5 @@ tc filter replace dev lo egress protocol ip pref 49152 flower \
   action csum ip and udp pipe \
   action mirred ingress redirect dev eth0
 
+# Allow 127.0.0.11 in this netns to be routed from TC mirred packets (they don't count as locally generated)
 sysctl -w net.ipv4.conf.all.route_localnet=1
