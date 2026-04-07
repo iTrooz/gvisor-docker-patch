@@ -13,6 +13,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 )
 
@@ -30,9 +31,9 @@ type eventKey struct {
 }
 
 // findFirstCustomNetwork finds the first custom Docker network details.
-func findFirstCustomNetwork(inspect container.InspectResponse) (string, string, string, string, error) {
+func findFirstCustomNetwork(inspect container.InspectResponse) (string, *network.EndpointSettings, error) {
 	if inspect.NetworkSettings == nil {
-		return "", "", "", "", errors.New("container has no network settings")
+		return "", nil, errors.New("container has no network settings")
 	}
 
 	networkNames := make([]string, 0, len(inspect.NetworkSettings.Networks))
@@ -48,11 +49,11 @@ func findFirstCustomNetwork(inspect container.InspectResponse) (string, string, 
 			continue
 		}
 		if cfg != nil && cfg.Gateway != "" && cfg.IPAddress != "" && cfg.MacAddress != "" {
-			return name, cfg.Gateway, cfg.IPAddress, cfg.MacAddress, nil
+			return name, cfg, nil
 		}
 	}
 
-	return "", "", "", "", errors.New("no custom network with gateway/ip/mac found")
+	return "", nil, errors.New("no custom network with gateway/ip/mac found")
 }
 
 // injectResolvConf writes the container resolv.conf through its host ResolvConfPath.
@@ -136,11 +137,15 @@ func watch(runtimeMatch string) error {
 					return
 				}
 
-				networkName, gatewayIP, containerIP, containerMAC, err := findFirstCustomNetwork(inspect)
+				networkName, ctNetwork, err := findFirstCustomNetwork(inspect)
 				if err != nil {
 					fmt.Printf("failed handling container %s: %v\n", containerID, err)
 					return
 				}
+
+				gatewayIP := ctNetwork.Gateway
+				containerIP := ctNetwork.IPAddress
+				containerMAC := ctNetwork.MacAddress
 
 				fmt.Printf("gVisor container %s started on network %s; gateway=%s container_ip=%s container_mac=%s\n", shortID(containerID), networkName, gatewayIP, containerIP, containerMAC)
 
