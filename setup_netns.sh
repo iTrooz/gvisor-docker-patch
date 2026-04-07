@@ -26,8 +26,6 @@ DOCKER_DNS_PORT=$(ss -lun | awk 'NR>1 {split($4, a, ":"); print a[2]}')
 # Setup route to Docker DNS:
 # - Only match DNS packets going to the host
 # - Write src and dst IPs (src is a special IP that we can match on the way back, dst is the loopback IP)
-# - "ptype host pipe" seems needed when multiple networks are attached to the container
-# edit - NOPE
 # - Docker OUTPUT table will not be used, so rewrite the port ourselves
 # Simulate packets coming from lo
 tc filter del dev "$IFACE" ingress
