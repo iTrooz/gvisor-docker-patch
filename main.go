@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"sort"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
@@ -26,25 +27,32 @@ var builtinNetworks = map[string]struct{}{
 
 type eventKey struct {
 	containerID string
-	networkID   string
 }
 
-// findNetworkGateway finds the gateway and container IP for the first custom Docker network.
-func findNetworkGateway(inspect container.InspectResponse) (string, string, error) {
+// findFirstCustomNetwork finds the first custom Docker network details.
+func findFirstCustomNetwork(inspect container.InspectResponse) (string, string, string, string, error) {
 	if inspect.NetworkSettings == nil {
-		return "", "", errors.New("container has no network settings")
+		return "", "", "", "", errors.New("container has no network settings")
 	}
 
-	for name, cfg := range inspect.NetworkSettings.Networks {
+	networkNames := make([]string, 0, len(inspect.NetworkSettings.Networks))
+	for name := range inspect.NetworkSettings.Networks {
+		networkNames = append(networkNames, name)
+	}
+	// Sort for deterministic behavior
+	sort.Strings(networkNames)
+
+	for _, name := range networkNames {
+		cfg := inspect.NetworkSettings.Networks[name]
 		if _, isBuiltin := builtinNetworks[name]; isBuiltin {
 			continue
 		}
-		if cfg != nil && cfg.Gateway != "" && cfg.IPAddress != "" {
-			return cfg.Gateway, cfg.IPAddress, nil
+		if cfg != nil && cfg.Gateway != "" && cfg.IPAddress != "" && cfg.MacAddress != "" {
+			return name, cfg.Gateway, cfg.IPAddress, cfg.MacAddress, nil
 		}
 	}
 
-	return "", "", errors.New("no custom network with a gateway found")
+	return "", "", "", "", errors.New("no custom network with gateway/ip/mac found")
 }
 
 // injectResolvConf writes the container resolv.conf through its host ResolvConfPath.
@@ -59,12 +67,12 @@ func injectResolvConf(hostResolvConfPath, gatewayIP string) error {
 }
 
 // setupNetNs runs setup_netns.sh in the container network namespace via nsenter.
-func setupNetNs(pid int, gatewayIP, containerIP string) error {
+func setupNetNs(pid int, gatewayIP, containerIP, containerMAC string) error {
 	if pid == 0 {
 		return errors.New("container has no PID")
 	}
 
-	cmd := exec.Command("nsenter", "-t", fmt.Sprintf("%d", pid), "-n", "--", SETUP_NETNS_SCRIPT, gatewayIP, containerIP)
+	cmd := exec.Command("nsenter", "-t", fmt.Sprintf("%d", pid), "-n", "--", SETUP_NETNS_SCRIPT, gatewayIP, containerIP, containerMAC)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -79,7 +87,7 @@ func setupNetNs(pid int, gatewayIP, containerIP string) error {
 	return nil
 }
 
-// watch listens for Docker network connect events and configures matching containers.
+// watch listens for Docker container start events and configures matching containers.
 func watch(runtimeMatch string) error {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -89,8 +97,8 @@ func watch(runtimeMatch string) error {
 
 	inflight := make(map[eventKey]struct{})
 
-	fmt.Println("listening for Docker network connect events")
-	f := filters.NewArgs(filters.Arg("type", "network"), filters.Arg("event", "connect"))
+	fmt.Println("listening for Docker container start events")
+	f := filters.NewArgs(filters.Arg("type", "container"), filters.Arg("event", "start"))
 	msgCh, errCh := cli.Events(ctx, events.ListOptions{Filters: f})
 
 	for {
@@ -100,16 +108,12 @@ func watch(runtimeMatch string) error {
 				return nil
 			}
 
-			containerID := event.Actor.Attributes["container"]
-			networkID := event.Actor.ID
-			if networkID == "" {
-				networkID = "unknown-network"
-			}
+			containerID := event.Actor.ID
 			if containerID == "" {
 				continue
 			}
 
-			key := eventKey{containerID: containerID, networkID: networkID}
+			key := eventKey{containerID: containerID}
 			if _, exists := inflight[key]; exists {
 				continue
 			}
@@ -132,13 +136,13 @@ func watch(runtimeMatch string) error {
 					return
 				}
 
-				gatewayIP, containerIP, err := findNetworkGateway(inspect)
+				networkName, gatewayIP, containerIP, containerMAC, err := findFirstCustomNetwork(inspect)
 				if err != nil {
 					fmt.Printf("failed handling container %s: %v\n", containerID, err)
 					return
 				}
 
-				fmt.Printf("gVisor container %s joined network %s; gateway=%s container_ip=%s\n", shortID(containerID), shortID(networkID), gatewayIP, containerIP)
+				fmt.Printf("gVisor container %s started on network %s; gateway=%s container_ip=%s container_mac=%s\n", shortID(containerID), networkName, gatewayIP, containerIP, containerMAC)
 
 				if err := injectResolvConf(inspect.ResolvConfPath, gatewayIP); err != nil {
 					fmt.Printf("failed handling container %s: %v\n", containerID, err)
@@ -146,7 +150,7 @@ func watch(runtimeMatch string) error {
 				}
 				fmt.Printf("  injected /etc/resolv.conf with nameserver %s\n", gatewayIP)
 
-				if err := setupNetNs(inspect.State.Pid, gatewayIP, containerIP); err != nil {
+				if err := setupNetNs(inspect.State.Pid, gatewayIP, containerIP, containerMAC); err != nil {
 					fmt.Printf("failed handling container %s: %v\n", containerID, err)
 					return
 				}
