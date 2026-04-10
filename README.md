@@ -13,5 +13,5 @@ This project setup rules on each gVisor (runsc) container netns on startup, redi
 It also overrides /etc/resolv.conf inside the container, by changing the DNS from 127.0.0.11 to, e.g., 172.22.0.1. This could theoretically be handlded by routing rules in the namespace
 
 # Limitations
-- Probably doesn't handle multiple network/network drivers well. Please open an issue if this happen to you
+- Probably doesn't handle multiple network drivers well. Please open an issue if this happen to you
 - Patch isn't applied before container startup, so doing `docker run --network=test --rm --runtime runsc -it nicolaka/netshoot nslookup google.com` won't work, or will at least lead to a race condition
