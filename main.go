@@ -88,12 +88,71 @@ func setupNetNs(pid int, gatewayIP, containerIP, containerMAC string) error {
 	return nil
 }
 
+// patchContainer inspects and applies the network patch to a single container if it matches the runtime.
+func patchContainer(ctx context.Context, cli *client.Client, containerID, runtimeMatch string) {
+	inspect, err := cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		fmt.Printf("failed handling container %s: %v\n", containerID, err)
+		return
+	}
+
+	runtime := ""
+	if inspect.HostConfig != nil {
+		runtime = inspect.HostConfig.Runtime
+	}
+	if runtime != runtimeMatch {
+		return
+	}
+
+	networkName, ctNetwork, err := findFirstCustomNetwork(inspect)
+	if err != nil {
+		fmt.Printf("failed handling container %s: %v\n", containerID, err)
+		return
+	}
+
+	gatewayIP := ctNetwork.Gateway
+	containerIP := ctNetwork.IPAddress
+	containerMAC := ctNetwork.MacAddress
+
+	fmt.Printf("gVisor container %s started on network %s; gateway=%s container_ip=%s container_mac=%s\n", shortID(containerID), networkName, gatewayIP, containerIP, containerMAC)
+
+	if err := injectResolvConf(inspect.ResolvConfPath, gatewayIP); err != nil {
+		fmt.Printf("failed handling container %s: %v\n", containerID, err)
+		return
+	}
+	fmt.Printf("  injected /etc/resolv.conf with nameserver %s\n", gatewayIP)
+
+	if err := setupNetNs(inspect.State.Pid, gatewayIP, containerIP, containerMAC); err != nil {
+		fmt.Printf("failed handling container %s: %v\n", containerID, err)
+		return
+	}
+	fmt.Println("  ran setup_lo.sh successfully")
+}
+
+// patchExistingContainers enumerates all running containers and patches any that match the runtime.
+func patchExistingContainers(ctx context.Context, cli *client.Client, runtimeMatch string) error {
+	containers, err := cli.ContainerList(ctx, container.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list containers: %w", err)
+	}
+
+	fmt.Printf("patching %d existing running containers\n", len(containers))
+	for _, c := range containers {
+		patchContainer(ctx, cli, c.ID, runtimeMatch)
+	}
+	return nil
+}
+
 // watch listens for Docker container start events and configures matching containers.
 func watch(runtimeMatch string) error {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return fmt.Errorf("create docker client: %w", err)
+	}
+
+	if err := patchExistingContainers(ctx, cli, runtimeMatch); err != nil {
+		return err
 	}
 
 	inflight := make(map[eventKey]struct{})
@@ -122,44 +181,7 @@ func watch(runtimeMatch string) error {
 
 			func() {
 				defer delete(inflight, key)
-
-				inspect, err := cli.ContainerInspect(ctx, containerID)
-				if err != nil {
-					fmt.Printf("failed handling container %s: %v\n", containerID, err)
-					return
-				}
-
-				runtime := ""
-				if inspect.HostConfig != nil {
-					runtime = inspect.HostConfig.Runtime
-				}
-				if runtime != runtimeMatch {
-					return
-				}
-
-				networkName, ctNetwork, err := findFirstCustomNetwork(inspect)
-				if err != nil {
-					fmt.Printf("failed handling container %s: %v\n", containerID, err)
-					return
-				}
-
-				gatewayIP := ctNetwork.Gateway
-				containerIP := ctNetwork.IPAddress
-				containerMAC := ctNetwork.MacAddress
-
-				fmt.Printf("gVisor container %s started on network %s; gateway=%s container_ip=%s container_mac=%s\n", shortID(containerID), networkName, gatewayIP, containerIP, containerMAC)
-
-				if err := injectResolvConf(inspect.ResolvConfPath, gatewayIP); err != nil {
-					fmt.Printf("failed handling container %s: %v\n", containerID, err)
-					return
-				}
-				fmt.Printf("  injected /etc/resolv.conf with nameserver %s\n", gatewayIP)
-
-				if err := setupNetNs(inspect.State.Pid, gatewayIP, containerIP, containerMAC); err != nil {
-					fmt.Printf("failed handling container %s: %v\n", containerID, err)
-					return
-				}
-				fmt.Println("  ran setup_lo.sh successfully")
+				patchContainer(ctx, cli, containerID, runtimeMatch)
 			}()
 
 		case err := <-errCh:
